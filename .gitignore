@@ -66,6 +66,10 @@ ASN2026/
 *.html
 *.pdf
 *.docx
+*.png
+*.jpeg
+*.pptx
+
 
 # RStudio Connect folder
 rsconnect/
