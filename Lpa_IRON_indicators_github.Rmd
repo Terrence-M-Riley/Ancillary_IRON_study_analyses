@@ -241,7 +241,6 @@ lm_table = lpa_table %>%
 
 
 
-These tests intend to identify associations between Fe-status indicators and Lp(a) at pre-study timepoint. Studies suggest Lp(a) is predictive of deficiency anemia. Whether this applies to indicators of Iron deficiency anemia is unknown. Associations between pre-study Lp(a) could help identify which anemias are related to Lp(a) and identify potentially overlapping metabolism to understand Lp(a) metabolic role.
 
 #Helper function for statistical models
 
