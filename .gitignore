@@ -45,5 +45,25 @@ docs/
 # translation temp files
 po/*~
 
+# Research data
+Raw_Data/
+*.xlsx
+*.xls
+*.csv
+*.rds
+*.sav
+*.sas7bdat
+
+# Analysis outputs
+Results/
+Figures/
+Tables/
+Output/
+
+# Common generated documents
+*.html
+*.pdf
+*.docx
+
 # RStudio Connect folder
 rsconnect/
