@@ -1,0 +1,887 @@
+---
+title: "IRON Study /n Higher lipoprotein(a) concentration is associated with a blunted response to iron repletion in women with low iron stores: /n a secondary analysis of a randomized controlled trial"
+author: "Terrence M. Riley"
+date: "2025-06-19"
+output:
+  html_document: default
+  word_document: default
+---
+
+#Packages
+
+```{r packages, include=FALSE, warning=FALSE, message=FALSE}
+
+options(scipen = 999) # Avoid scientific notation
+
+# This function was originally posted here: https://stackoverflow.com/questions/4090169/elegant-way-to-check-for-missing-packages-and-install-them/19873732
+using = function(...) { 
+    libs = unlist(list(...))
+    req = unlist(lapply(libs,require,character.only=TRUE))
+    need = libs[req==FALSE]
+    if(length(need)>0){ 
+        install.packages(need)
+        lapply(need,require,character.only=TRUE)
+    }
+}
+
+
+using("ggplot2", "ggforce", "ggsci", "ggpubr", "ggtext", "readxl", "janitor", "openxlsx", "glue", "broom.mixed", "ggpubr", "tidyverse", "emmeans", "flexplot", "pscl", "gt", "gtsummary", "flextable", "performance", "purrr", "factoextra", "patchwork", "tidyverse", "openxlsx", "officer", "DescTools")
+```
+
+#Importing data
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+
+#Import the raw biochemical data
+raw_data = read_excel('Raw_Data/Iron Lab (Meditech) - 2025-06-16 19 32 42.xlsx') %>%
+  .[-(1:8), ] %>%
+  row_to_names(1)
+
+#Impute the values for left and right censoring
+#Left censoring is coded as 9
+#Right censoring is coded as 101
+#new column with imputed data is "lpa"
+imputed_data = raw_data %>%
+  mutate(TestValue = as.numeric(TestValue),
+         lpa = if_else(!is.na(TestValue), TestValue, 
+                       if_else(Censor == "< 10.0", 9, 101)), #This analysis coded censored values as 1-censor value. We recognize that other approaches may be used/preferred. 
+         Time = if_else(Comments == "VISIT 1", "1", "2"),
+         Time = factor(Time, levels = c("1", "2")),
+         timepoint = case_when(Time == "1" ~ "pre",
+                               T ~ "post"), 
+         Site = case_when(str_detect(SubjectID, "F") ~ "FSU",
+                          T ~ "PBRC"),
+         Censor = case_when(is.na(Censor) ~ "No Censor",
+                            T ~ Censor)) %>%
+  dplyr::select(SubjectID, lpa, timepoint, Site, Censor) %>%
+  pivot_wider(names_from = timepoint, 
+              values_from = c(lpa, Censor), 
+              names_glue = "{.value}_{timepoint}")
+  
+
+#Metadata for anthropometrics and demographics
+#Race data is cleaned to align with the original publication.
+anthro = read_excel('Raw_Data/IRON MASTER FILE (002).xlsx', sheet = 'Anthropometrics') %>%
+  clean_names(.) %>% #clean_names() introduces #s into column names and the section below modifies the names to be more intuitive
+  .[1:52, ] %>%
+  rename("SubjectID" = "subject_id", "Treatment" = "x2", "Ht_avg_pre" = "average_9",
+         "Ht_avg_post" = "average_12", "Wt_avg_pre" = "average_15", "Wt_avg_post" = "average_18") %>% 
+  dplyr::select(SubjectID, age_at_enrollment, race, ethnicity, Ht_avg_pre, Ht_avg_post, Wt_avg_pre, Wt_avg_post) %>%
+  mutate(race = gsub("-", " ", race),
+         Race = case_when(race == "Other" ~ "Other", #Includes unknown
+                          race == str_detect(race, "Asian") ~ "Asian",
+                          race == "Don't Know" ~ "Other", 
+                          race == "White" ~ "White",
+                          race == "Black or African American" ~ "Black or African American",
+                          T ~ "Asian"),
+         across(c("age_at_enrollment", "Ht_avg_pre", "Ht_avg_post", "Wt_avg_pre", "Wt_avg_post"), as.numeric),
+         BMI_baseline = (Wt_avg_pre)/((Ht_avg_pre/100)^2),
+         BMI_endpoint = (Wt_avg_post)/((Ht_avg_post/100)^2))
+
+Fe_indicators = read_excel('Raw_Data/IRON MASTER FILE (002).xlsx', sheet = 'Iron and anemia markers') %>%
+  clean_names(.) %>%
+  .[1:52, ] %>%
+  dplyr::select(-x1, -x54) %>%
+  rename(SubjectID = subject_id) %>%
+  mutate(across(c(iron_baseline, iron_endpoint), as.numeric),
+         ferritin_status_baseline = case_when(ferritin_baseline < 25 ~ "< 25",
+                                              T ~ ">= 25"),
+         ferritin_status_endpoint = case_when(ferritin_endpoint < 25 ~ "< 25",
+                                       T ~ ">= 25")) %>%
+  dplyr::rename(s_tf_r_baseline_mg_l = s_tf_r_baseline_12, s_tf_r_endpoint_mg_l = s_tf_r_endpoint_13,
+                s_tf_r_baseline_nmol = s_tf_r_baseline_15, s_tf_r_endpoint_nmol = s_tf_r_endpoint_16,
+                agp_baseline_g_ml = agp_baseline_32, agp_endpoint_g_ml = agp_endpoint_33, 
+                agp_baseline_g_l = agp_baseline_35, agp_endpoint_g_l = agp_endpoint_36)
+
+
+met_markers = read_excel('Raw_Data/IRON MASTER FILE (002).xlsx', sheet = 'Metabolic markers') %>%
+  clean_names(.) %>%
+  .[1:52, ] %>%
+  dplyr::select(-x1, -treatment) %>%
+  rename(SubjectID = subject_id) %>%
+  mutate(across(-SubjectID, as.numeric))
+  
+
+
+#Table used for the downstream analyses
+#Censoring was included if this is the preferred approach
+lpa_table = imputed_data %>%
+  full_join(anthro, by = "SubjectID") %>%
+  full_join(Fe_indicators, by = "SubjectID") %>%
+  full_join(met_markers, by = "SubjectID") %>%
+  mutate(SubjectID = factor(SubjectID),
+         treatment = factor(treatment),
+         # iron = if_else(abs(iron- mean(iron, na.rm = TRUE)) > 3 * sd(iron, na.rm = TRUE),
+         #                    NA_real_, iron),
+         pre_stratum = case_when(lpa_pre < 30 ~ "Low",
+                             T ~ "Elevated"), 
+         pre_stratum = factor(pre_stratum, levels = c("Low", "Elevated")),
+         pre_stratum = relevel(pre_stratum, ref = "Low")) %>%
+  dplyr::select(-matches("Change", ignore.case = T))
+
+lpa_table$ferritin_baseline[lpa_table$SubjectID == "A00-09-7270"] = NA #One participant had unreliable ferritin levels at baseline
+
+```
+
+# Descriptive statistics
+
+```{r Descriptive table by treatment, warning=FALSE, message=FALSE}
+#Produce a table that includes descriptive by the study treatment 
+# (summary_tx = lpa_table %>%
+#   relocate(Post_lpa, .after = Pre_lpa) %>%
+#   relocate(Race, .after = BMI_baseline) %>%
+#   relocate(Pre_Censor, .after = Post_lpa) %>%
+#   rename("Post Lp(a)" = Post_lpa, "Pre Lp(a)" = Pre_lpa) %>%
+#   tbl_summary(include = -SubjectID, 
+#               by = treatment,
+#               statistic = list(all_continuous() ~ "{mean} ({sd})",
+#                                c("Pre Lp(a)") ~ "{median} ({p25}, {p75})",
+#                                c("Post Lp(a)") ~ "{median} ({p25}, {p75})")) %>%
+#    add_p())
+
+
+# writexl::write_xlsx(as_tibble(summary_tx), path = "summary_table_by_Tx.xlsx")
+```
+
+```{r Descriptive pre vs post, }
+#Produce a table that includes descriptive by the study treatment 
+format_summary_table = lpa_table %>%
+  rename_with(~ str_replace(.x, "_baseline_(.*)$", "_\\1_pre")) %>% #This captures any column names with baseline in the middle of the name, cuts it out, places _pre at the end of the original name without baseline
+  rename_with(~ str_replace(.x, "_endpoint_(.*)$", "_\\1_post")) %>% #This does the same as above but with endpoint
+  rename_with(~ str_replace(.x, "_baseline$", "_pre")) %>%
+  rename_with(~ str_replace(.x, "_endpoint$", "_post")) %>%
+  pivot_longer(cols = matches("_(pre|post)$"), names_to = c(".value", "timepoint"), names_pattern = "^(.*)_(pre|post)$") %>%
+  mutate(Censor = factor(Censor, levels = c("< 10.0", "No Censor", "> 100.0")),
+         Race = factor(Race),
+         timepoint = factor(timepoint, levels = c("pre", "post"))) %>%
+  dplyr::select(-race, -ethnicity)
+
+(summary_timepoint = format_summary_table %>%
+  tbl_summary(include = -c(SubjectID, Site),
+              by = timepoint,
+              missing = "no",
+              statistic = list(all_continuous() ~ "{mean} ({sd})",
+                               lpa ~ "{median} ({p25}, {p75})")) %>%
+   add_p(group = SubjectID, 
+         test = list(all_continuous() ~ "paired.t.test",
+                     c(lpa, crp) ~ "paired.wilcox.test")))
+
+
+DescTools::StuartMaxwellTest(lpa_table$Censor_pre, lpa_table$Censor_post)
+
+```
+
+
+```{r descriptive by lpa cat and timepoint}
+
+(summary_full = format_summary_table %>%
+    tbl_strata(strata = timepoint,
+               .tbl_fun = ~.x %>%
+                 tbl_summary(include = -SubjectID,
+                             by = pre_stratum,
+                             missing = "no",
+                             statistic = list(all_continuous() ~ "{mean} ({sd})", 
+                                              c("lpa") ~ "{median} ({p25}, {p75})",
+                                              c("crp") ~ "{median} ({p25}, {p75})")) %>% 
+    add_p()))
+
+
+
+```
+
+
+#Create variables and models vectors
+
+```{r variables and models vectors}
+#Checking for residual normality: crp, iron, hepcidin_ng_m_l, agp
+endpoint_variables = c(post_ferritin = "Ferritin (µg/L)",
+                       post_s_tf_r_mg_l = "Serum transferrin receptor (mg/L)",
+                       post_body_iron= "Body iron (mg/kg)",
+                       post_hepcidin_ng_m_l = "Hepcidin (ng/mL)",
+                       post_crp = "hs-CRP (mg/L)",
+                       post_agp_g_ml = "Alpha-1-glycoprotein (g/mL)",
+                       post_ts = "Transferrin saturation (%)",
+                       post_iron = "Serum iron (µg/dL)",
+                       post_hgb = "Hemoglobin (g/dL)",
+                       post_hct = "Hematocrit (%)")
+
+baseline_variables = c(pre_ferritin = "Baseline ferritin (µg/L)",
+                       pre_s_tf_r_mg_l = "Baseline serum transferrin receptor (mg/L)",
+                       pre_body_iron = "Baseline body iron (mg/kg)",
+                       pre_hepcidin_ng_m_l = "Baseline hepcidin (ng/mL)",
+                       pre_crp = "Baseline hs-CRP (mg/L)",
+                       pre_agp_g_ml = "Baseline alpha-1-glycoprotein (g/mL)",
+                       pre_ts = "Baseline transferrin saturation (%)",
+                       pre_iron = "Baseline serum iron (µg/dL)",
+                       pre_hgb = "Baseline hemoglobin (g/dL)",
+                       pre_hct = "Baseline hematocrit (%)")
+
+# Sequential sensitivity model specifications
+sensitivity_models = list("Model 1 (Base)" = NULL,
+                          "Model 2 (+ CRP)" = c("pre_crp"),
+                          "Model 3 (+ AGP)" = c("pre_crp", "pre_agp_g_ml"),
+                          "Model 4 (+ BMI)" = c("pre_crp", "pre_agp_g_ml", "pre_BMI"),
+                          "Model 5 (+ Race)" = c("pre_crp", "pre_agp_g_ml", "pre_BMI",  "Race"))
+
+non_linear_variables = c(pre_crp = "Baseline hs-CRP (mg/L)",
+                         post_crp = "hs-CRP (mg/L)")
+
+```
+
+#Create lm table
+
+```{r}
+lm_table = lpa_table %>%
+  rename_with(~ str_replace(.x, "(.*)_baseline_(.*)$", "pre_\\1_\\2") ) %>% #This captures any column names with baseline in the middle of the name, cuts it out, places pre_ at the beginning of the original name without baseline (the (.*) == \\1 or \\2 depending on the side of column name)
+  rename_with(~ str_replace(.x, "(.*)_endpoint_(.*)$", "post_\\1_\\2") ) %>% #This does the same as above but with endpoint
+  rename_with(~ str_replace(.x, "(.*)_baseline$", "pre_\\1")) %>%
+  rename_with(~ str_replace(.x, "(.*)_endpoint$", "post_\\1")) 
+```
+
+
+
+
+These tests intend to identify associations between Fe-status indicators and Lp(a) at pre-study timepoint. Studies suggest Lp(a) is predictive of deficiency anemia. Whether this applies to indicators of Iron deficiency anemia is unknown. Associations between pre-study Lp(a) could help identify which anemias are related to Lp(a) and identify potentially overlapping metabolism to understand Lp(a) metabolic role.
+
+#Helper function for statistical models
+
+```{r Helper function}
+# Used by every function below, so the modeling logic only lives in one place.
+ 
+# Fits lm() if family is NULL, otherwise glm() with that family.
+fit_model = function(dependent, predictors, data, family = NULL) {
+  formula = as.formula(paste(dependent, "~", paste(predictors, collapse = " + ")))
+  if (is.null(family)) {
+    lm(formula, data = data)
+    } else {
+      glm(formula, data = data, family = family)
+    }
+  }
+ 
+# lm's real R2
+model_r2 = function(fit) {
+  if (inherits(fit, "glm")) as.numeric(r2(fit)[[1]]) else summary(fit)$r.squared
+  }
+
+```
+
+# Linear modeling for primary outcomes 
+
+```{r lm function}
+
+#To run the analysis by stratum, change the exposure to "pre_stratum."
+
+run_lpa_associations = function(data, dep_vars = NULL, exposure = "pre_lpa", covariates = NULL, adjust_baseline = FALSE, non_linear_variables = NULL, family = NULL, exponentiate = FALSE) {
+ 
+  map_dfr(names(dep_vars), function(v) {
+    
+    if(v %in% names(non_linear_variables)){
+      baseline_var = if (adjust_baseline) gsub("^post_", "pre_", v) else NULL
+      model_covariates = setdiff(covariates, c(v, baseline_var))
+      predictors = unique(c(exposure, baseline_var, model_covariates))
+      fit = fit_model(v, predictors, data, family)
+      output = tidy(fit, conf.int = T, exponentiate = exponentiate) %>% 
+        filter(startsWith(term, exposure))
+    } else {
+      baseline_var = if (adjust_baseline) gsub("^post_", "pre_", v) else NULL
+      model_covariates = setdiff(covariates, c(v, baseline_var))
+      predictors = unique(c(exposure, baseline_var, model_covariates))
+      fit = fit_model(v, predictors, data)
+      output = tidy(fit, conf.int = T) %>% 
+        filter(startsWith(term, exposure))
+    }
+    tibble(variable = v,
+           label = dep_vars[[v]],
+           formula = paste(v, "~", paste(predictors, collapse = " + ")),
+           model = list(fit), # the actual lm object
+           term = output$term, 
+           estimate = output$estimate,
+           se = output$std.error,
+           ci_lower = output$conf.low,
+           ci_upper = output$conf.high,
+           p_value = output$p.value,
+           n = length(fit$residuals),
+           r2 = if (inherits(fit, "glm")) NA_real_ else model_r2(fit))
+  })
+}
+```
+
+```{r primary output base and end, warning=FALSE}
+# Outputs: 
+(baseline_primary_results = run_lpa_associations(lm_table, 
+                                                 baseline_variables, 
+                                                 exposure = "lpa_pre",
+                                                 covariates = NULL, #add site here to check and see if Site had an effect on main outcomes 
+                                                 adjust_baseline = F, 
+                                                 non_linear_variables = non_linear_variables, 
+                                                 family = Gamma(link = "log"), 
+                                                 exponentiate = T))
+
+(endpoint_primary_results = run_lpa_associations(lm_table, 
+                                                 endpoint_variables,
+                                                 exposure = "pre_stratum",
+                                                 covariates = NULL, ##add site here to check and see if Site had an effect on main outcomes
+                                                 adjust_baseline = T,
+                                                 non_linear_variables = non_linear_variables,
+                                                 family = Gamma(link = "log"),
+                                                 exponentiate = T))
+ 
+#There is a convergence warning for crp likely from an outlier at baseline. Removal of this individual did not alter the significance of the results so they were retained in the final analysis. Removal of the individual can be tested using lm_table[-9, ] for the data input.  
+ 
+```
+
+```{r test residuals}
+# QQ plot
+pre_qq_plot = baseline_primary_results$model[[which(baseline_primary_results$variable == "pre_ferritin")]] #Extract the model from the primary output
+ggplot(data.frame(resid = resid(pre_qq_plot)), aes(sample = resid)) +
+  stat_qq() +
+  stat_qq_line() +
+  labs(x = "Theoretical quantiles", y = "Sample quantiles")
+
+post_qq_plot = endpoint_primary_results$model[[which(endpoint_primary_results$variable == "post_ferritin")]] #extract the model from the primary output
+ggplot(data.frame(resid = resid(post_qq_plot)), aes(sample = resid)) +
+  stat_qq() +
+  stat_qq_line() +
+  labs(x = "Theoretical quantiles", y = "Sample quantiles")
+
+#For hs-CRP glm modeling
+pre_qq_plot = baseline_primary_results$model[[which(baseline_primary_results$variable == "pre_crp")]] #Extract the model from the primary output
+ggplot(data.frame(resid = resid(pre_qq_plot, type = "deviance")), aes(sample = resid)) +
+  stat_qq() +
+  stat_qq_line() +
+  labs(x = "Theoretical quantiles", y = "Sample quantiles")
+
+#For hs-CRP glm modeling
+post_qq_plot = endpoint_primary_results$model[[which(endpoint_primary_results$variable == "post_crp")]] #extract the model from the primary output 
+ggplot(data.frame(resid = resid(post_qq_plot, type = "deviance")), aes(sample = resid)) +
+  stat_qq() +
+  stat_qq_line() +
+  labs(x = "Theoretical quantiles", y = "Sample quantiles")
+
+```
+
+
+#Sensitivity models
+
+```{r sensitivity lm, warning=FALSE}
+
+baseline_sensitivity_results = purrr::imap_dfr(sensitivity_models, 
+                                               ~ run_lpa_associations(data = lm_table, 
+                                                                      dep_var = baseline_variables, 
+                                                                      exposure = "pre_stratum",
+                                                                      covariates = .x, 
+                                                                      adjust_baseline = F,
+                                                                      non_linear_variables = non_linear_variables,
+                                                                      family = Gamma(link = "log"),
+                                                                      exponentiate = T) %>%
+                                                 mutate(model_name = .y)) %>%
+  mutate(variable = factor(variable, levels = names(baseline_variables))) %>%
+  arrange(variable, formula) %>%
+  distinct(formula, .keep_all = T)
+
+
+endpoint_sensitivity_results = purrr::imap_dfr(sensitivity_models, 
+                                               ~ run_lpa_associations(data = lm_table, 
+                                                                      dep_vars = endpoint_variables, 
+                                                                      exposure = "pre_stratum",
+                                                                      covariates = .x, 
+                                                                      adjust_baseline = T,
+                                                                      non_linear_variables = non_linear_variables,
+                                                                      family = Gamma(link = "log"),
+                                                                      exponentiate = T) %>%
+                                                 mutate(model_name = .y)) %>%
+  mutate(variable = factor(variable, levels = names(endpoint_variables))) %>%
+  arrange(variable, formula) %>%
+  distinct(formula, .keep_all = T)
+
+
+#check_glm = glm(pre_crp ~ lpa_pre, data = lm_table, family = Gamma(link = "log"))
+check_lm = lm(post_ferritin ~ pre_stratum + pre_ferritin, data = lm_table)
+```
+
+
+##Full output
+
+```{r full output table}
+baseline_full_results = baseline_sensitivity_results %>%
+  mutate(model_terms = purrr::map(model, 
+                                  ~ broom::tidy(.x, conf.int = T, exponentiate = T) %>%
+                                    dplyr::filter(term != "(Intercept)") %>%
+                                    dplyr::select(term, estimate, conf.low, conf.high, p.value) %>%
+                                    pivot_wider(names_from = term, values_from = c(estimate, conf.low, conf.high, p.value), names_glue = "{term}_{.value}"))) %>%
+  unnest_wider(model_terms) %>%
+  mutate(race_f = purrr::map_dbl(model, 
+                                 ~ { x = drop1(.x, test = "F")
+                                 if ("Race" %in% rownames(x)) x["Race", "F value"] else NA_real_
+                                 }), 
+         race_p = purrr::map_dbl(model,
+                                  ~ { x = drop1(.x, test = "F")
+                                  if ("Race" %in% rownames(x)) x["Race", "Pr(>F)"] else NA_real_ 
+                                  }))
+
+endpoint_full_results = endpoint_sensitivity_results %>%
+  mutate(model_terms = purrr::map(model, 
+                                  ~ broom::tidy(.x, conf.int = T, exponentiate = T) %>%
+                                    dplyr::filter(term != "(Intercept)") %>%
+                                    dplyr::select(term, estimate, conf.low, conf.high, p.value) %>%
+                                    pivot_wider(names_from = term, values_from = c(estimate, conf.low, conf.high, p.value), names_glue = "{term}_{.value}"))) %>%
+  unnest_wider(model_terms) %>%
+  mutate(race_f = purrr::map_dbl(model, 
+                                 ~ { x = drop1(.x, test = "F")
+                                 if ("Race" %in% rownames(x)) x["Race", "F value"] else NA_real_
+                                 }), 
+         race_p = purrr::map_dbl(model,
+                                  ~ { x = drop1(.x, test = "F")
+                                  if ("Race" %in% rownames(x)) x["Race", "Pr(>F)"] else NA_real_ 
+                                  }))
+
+#Convergence warnings are likely related to outliers with glm analysis. Removal of outliers did not change the significance of comparisions. 
+
+writexl::write_xlsx(endpoint_full_results, path = "endpoint_sensitivity_summary.xlsx")
+```
+
+
+
+#Plot baseline continuous associations
+
+```{r plot baseline continuous associations}
+#Plot baseline significant results: Ferritin, Body iron
+#Replace lpa_pre with pre_stratum
+
+lm_base_ferritin = baseline_full_results %>% 
+  dplyr::filter(formula == "pre_ferritin ~ lpa_pre") %>%
+  pull(model) %>%
+  .[[1]]
+
+tidy_base_ferritin = broom::tidy(lm_base_ferritin, conf.int = T)
+  
+
+#summary(lm_base_ferritin) #Check the model was extracted properly
+
+label_base_ferritin = tidy_base_ferritin %>% 
+  dplyr::filter(term == "lpa_pre") %>%
+  dplyr::summarise(label = sprintf("%.2f [95%% CI: %.2f, %.2f]",estimate, conf.low, conf.high)) %>%
+  pull(label)
+
+(plot_base_ferritin = lm_table %>%
+    ggplot(aes(x = lpa_pre, y = pre_ferritin)) + 
+    geom_point(color = "steelblue", size = 2) + 
+    geom_abline(slope = coef(lm_base_ferritin)[["lpa_pre"]], intercept = coef(lm_base_ferritin)[["(Intercept)"]],
+               color = "black", linewidth = 0.9, linetype = "dashed") + 
+    labs(y = "Baseline Lp(a) concentration (mg/dL)", x = "Baseline ferritin (µg/L)" ) +
+    annotate("text", x= Inf, y = Inf, hjust=1.1, vjust = 3.5, label = label_base_ferritin, size = 4) + 
+    theme_classic(base_size = 12, base_family = "Times New Roman"))
+
+
+
+lm_base_body_iron = baseline_full_results %>% 
+  dplyr::filter(formula == "pre_body_iron ~ lpa_pre") %>%
+  pull(model) %>%
+  .[[1]]
+
+#summary(lm_base_body_iron)  #Check the model was extracted properly
+
+tidy_base_body_iron = broom::tidy(lm_base_body_iron, conf.int = T)
+
+label_base_body_iron = tidy_base_body_iron %>% 
+  dplyr::filter(term == "lpa_pre") %>%
+  dplyr::summarise(label = sprintf("%.2f [95%% CI: %.2f, %.2f]",estimate, conf.low, conf.high)) %>%
+  pull(label)
+
+(plot_base_body_iron = lm_table %>%
+    ggplot(aes(x = lpa_pre, y = pre_body_iron)) + 
+    geom_point(color = "steelblue", size = 2) + 
+    geom_abline(slope = coef(lm_base_body_iron)[["lpa_pre"]], intercept = coef(lm_base_body_iron)[["(Intercept)"]],
+               color = "black", linewidth = 0.9, linetype = "dashed") + 
+    labs(y = "Baseline Lp(a) concentration (mg/dL)", x = "Baseline body iron (mg/kg)" ) +
+    annotate("text", x= Inf, y = Inf, hjust=1.1, vjust = 3.5, label = label_base_body_iron, size = 4) + 
+    theme_classic(base_size = 12, base_family = "Times New Roman"))
+
+
+plot_base_combined = (plot_base_ferritin / plot_base_body_iron) + 
+  plot_annotation(tag_levels = "A") & theme(plot.tag = element_text(color = "black", size = 12, family = "Times New Roman", face = "bold"))
+
+ggsave("base_combined_plot.pdf", plot = plot_base_combined, width = 7, height = 7, device = cairo_pdf)
+
+```
+
+
+
+
+#Plots for endpoint continuous associations
+
+```{r plot endpoint continuous associations}
+
+lm_post_ts = endpoint_full_results %>% 
+  dplyr::filter(formula == "post_ts ~ lpa_pre + pre_ts") %>%
+  pull(model) %>%
+  .[[1]]
+
+#summary(lm_post_ts) #Check the model was extracted properly
+
+tidy_post_ts = broom::tidy(lm_post_ts, conf.int = T)
+
+label_post_ts = tidy_post_ts %>% 
+  dplyr::filter(term == "lpa_pre") %>%
+  dplyr::summarise(label = sprintf("%.2f [95%% CI: %.2f, %.2f]",estimate, conf.low, conf.high)) %>%
+  pull(label)
+
+lm_post_iron = endpoint_full_results %>% 
+  dplyr::filter(formula == "post_iron ~ lpa_pre + pre_iron") %>%
+  pull(model) %>%
+  .[[1]]
+
+#summary(lm_post_ts) #Check the model was extracted properly
+
+tidy_post_iron = broom::tidy(lm_post_iron, conf.int = T)
+
+label_post_iron = tidy_post_iron %>% 
+  dplyr::filter(term == "lpa_pre") %>%
+  dplyr::summarise(label = sprintf("%.2f [95%% CI: %.2f, %.2f]",estimate, conf.low, conf.high)) %>%
+  pull(label)
+
+
+glm_post_crp = endpoint_full_results %>% 
+  dplyr::filter(formula == "post_crp ~ lpa_pre + pre_crp") %>%
+  pull(model) %>%
+  .[[1]]
+
+#summary(lm_post_ts) #Check the model was extracted properly
+
+tidy_post_crp = broom::tidy(glm_post_crp, conf.int = T)
+
+label_post_crp = tidy_post_crp %>% 
+  dplyr::filter(term == "lpa_pre") %>%
+  mutate(estimate = (exp(estimate)-1)*100,
+         conf.low = (exp(conf.low)-1)*100,
+         conf.high = (exp(conf.high)-1)*100) %>%
+  dplyr::summarise(label = sprintf("%.1f%% [95%% CI: %.1f%%, %.1f%%]", estimate, conf.low, conf.high)) %>%
+  pull(label)
+
+lm_resid_ts = lm(post_ts ~ pre_ts, data = lm_table)
+lm_resid_iron = lm(post_iron ~ pre_iron, data = lm_table)
+glm_resid_crp = glm(post_crp ~ pre_crp, data = lm_table)
+
+
+plot_lm_table = lm_table %>%
+  mutate(resid_ts = residuals(lm_resid_ts), 
+         resid_iron = residuals(lm_resid_iron),
+         resid_crp = residuals(glm_resid_crp, type = "response"),
+         adj_ts = mean(post_ts, na.rm = T) + resid_ts,
+         adj_iron = mean(post_iron, na.rm=T) + resid_iron,
+         adj_crp = mean(post_crp, na.rm=T) + resid_crp)
+
+
+(plot_end_ts = plot_lm_table %>%
+    ggplot(aes(x = lpa_pre, y = adj_ts)) + 
+    geom_point(color = "steelblue", size = 2) + 
+    geom_abline(slope = coef(lm_post_ts)[["lpa_pre"]], intercept = coef(lm_post_ts)[["(Intercept)"]],
+               color = "black", linewidth = 0.9, linetype = "dashed") + 
+    labs(x = NULL, y = "Adj. transferrin saturation (%)" ) +
+    annotate("text", x= Inf, y = Inf, hjust=1.1, vjust = 3.5, label = label_post_ts, size = 4) + 
+    theme_classic(base_size = 12, base_family = "Times New Roman"))
+
+(plot_end_iron = plot_lm_table %>%
+    ggplot(aes(x = lpa_pre, y = adj_iron)) + 
+    geom_point(color = "steelblue", size = 2) + 
+    geom_abline(slope = coef(lm_post_iron)[["lpa_pre"]], intercept = coef(lm_post_iron)[["(Intercept)"]],
+               color = "black", linewidth = 0.9, linetype = "dashed") + 
+    labs(x = NULL, y = "Adj. serum iron (µg/dL)" ) +
+    annotate("text", x= Inf, y = Inf, hjust=1.1, vjust = 3.5, label = label_post_iron, size = 4) + 
+    theme_classic(base_size = 12, base_family = "Times New Roman"))
+
+
+(plot_end_crp = plot_lm_table %>%
+    ggplot(aes(x = lpa_pre, y = adj_crp)) + 
+    geom_point(color = "steelblue", size = 2) + 
+    stat_function(fun = function(x) {
+      exp(coef(glm_post_crp)[["(Intercept)"]] +
+          coef(glm_post_crp)[["lpa_pre"]]*x)
+    }, linewidth = 0.9, linetype = "dashed") + 
+    labs(x = "Baseline Lp(a) concentration (mg/dL)", y = "Adj. hs-CRP (mg/L)" ) +
+    annotate("text", x= Inf, y = Inf, hjust=1.1, vjust = 3.5, label = label_post_crp, size = 4) + 
+    theme_classic(base_size = 12, base_family = "Times New Roman"))
+
+plot_post_combined = (plot_end_ts / plot_end_iron / plot_end_crp) + 
+  plot_annotation(tag_levels = "A") & theme(plot.tag = element_text(color = "black", size = 12, family = "Times New Roman", face = "bold"))
+
+ggsave("end_combined_plot.pdf", plot = plot_post_combined, width = 7, height = 10, device = cairo_pdf)
+
+```
+
+
+
+#Plots for endpoint categorical associations
+
+```{r plot endpoint categorical associations}
+
+endpoint_sensitivity_stratum = purrr::imap_dfr(sensitivity_models, 
+                                               ~ run_lpa_associations(data = lm_table,
+                                                                      exposure = "pre_stratum",
+                                                                      dep_vars = endpoint_variables, 
+                                                                      covariates = .x, 
+                                                                      adjust_baseline = T,
+                                                                      non_linear_variables = non_linear_variables,
+                                                                      family = Gamma(link = "log"),
+                                                                      exponentiate = T) %>%
+                                                 mutate(model_name = .y)) %>%
+  mutate(variable = factor(variable, levels = names(endpoint_variables))) %>%
+  arrange(variable, formula) %>%
+  distinct(formula, .keep_all = T)
+
+endpoint_full_stratum = endpoint_sensitivity_stratum %>%
+  mutate(model_terms = purrr::map(model, 
+                                  ~ broom::tidy(.x, conf.int = T) %>%
+                                    dplyr::filter(term != "(Intercept)") %>%
+                                    dplyr::select(term, estimate, conf.low, conf.high, p.value) %>%
+                                    pivot_wider(names_from = term, values_from = c(estimate, conf.low, conf.high, p.value), names_glue = "{term}_{.value}"))) %>%
+  unnest_wider(model_terms) %>%
+  mutate(race_f = purrr::map_dbl(model, 
+                                 ~ { x = drop1(.x, test = "F")
+                                 if ("Race" %in% rownames(x)) x["Race", "F value"] else NA_real_
+                                 }), 
+         race_p = purrr::map_dbl(model,
+                                  ~ { x = drop1(.x, test = "F")
+                                  if ("Race" %in% rownames(x)) x["Race", "Pr(>F)"] else NA_real_ 
+                                  }))
+
+#Convergence warnings are likely related to outliers with glm analysis. Removal of outliers did not change the significance of comparisions. 
+
+#writexl::write_xlsx(endpoint_full_results, path = "endpoint_sensitivity_summary.xlsx")
+
+
+lm_post_ts_stratum = endpoint_full_stratum %>% 
+  dplyr::filter(formula == "post_ts ~ pre_stratum + pre_ts") %>%
+  pull(model) %>%
+  .[[1]]
+
+#summary(lm_post_ts) #Check the model was extracted properly
+
+tidy_post_ts_stratum = broom::tidy(lm_post_ts_stratum, conf.int = T)
+
+label_post_ts_stratum = tidy_post_ts_stratum %>% 
+  dplyr::filter(term == "pre_stratumElevated") %>%
+  dplyr::summarise(label = sprintf("%.1f%% [95%% CI: %.1f%%, %.1f%%], \np = %.4f",estimate, conf.low, conf.high, p.value)) %>%
+  pull(label)
+
+lm_post_iron_stratum = endpoint_full_stratum %>% 
+  dplyr::filter(formula == "post_iron ~ pre_stratum + pre_iron") %>%
+  pull(model) %>%
+  .[[1]]
+
+#summary(lm_post_ts) #Check the model was extracted properly
+
+tidy_post_iron_stratum = broom::tidy(lm_post_iron_stratum, conf.int = T)
+
+label_post_iron_stratum = tidy_post_iron_stratum %>% 
+  dplyr::filter(term == "pre_stratumElevated") %>%
+  dplyr::summarise(label = sprintf("%.0f [95%% CI: %.0f, %.0f], \np = %.4f",estimate, conf.low, conf.high, p.value)) %>%
+  pull(label)
+
+
+glm_post_crp_stratum = endpoint_full_stratum %>% 
+  dplyr::filter(formula == "post_crp ~ pre_stratum + pre_crp") %>%
+  pull(model) %>%
+  .[[1]]
+
+#summary(lm_post_ts) #Check the model was extracted properly
+
+tidy_post_crp_stratum = broom::tidy(glm_post_crp_stratum, conf.int = T)
+
+label_post_crp_stratum = tidy_post_crp_stratum %>% 
+  dplyr::filter(term == "pre_stratumElevated") %>%
+  mutate(estimate = round((exp(estimate)-1)*100, 1),
+         conf.low = round((exp(conf.low)-1)*100,1),
+         conf.high = round((exp(conf.high)-1)*100, 1)) %>%
+  dplyr::summarise(label = sprintf("%.0f%% [95%% CI: %.0f%%, %.0f%%],\np = %.4f", estimate, conf.low, conf.high, p.value)) %>%
+  pull(label)
+
+#Use plot_lm_table to import the residuals from the baseline models.
+mean_ts = round(mean(plot_lm_table$post_ts, na.rm = T), 1)
+mean_iron = round(mean(plot_lm_table$post_iron, na.rm = T), 0)
+mean_crp = round(mean(lm_table$post_crp, na.rm = T), 1)
+
+lpa_pre_min = min(plot_lm_table$lpa_pre, na.rm = T)
+lpa_pre_max = max(plot_lm_table$lpa_pre, na.rm = T)
+
+post_ts_min = min(plot_lm_table$adj_ts, na.rm = T)
+post_ts_max = max(plot_lm_table$adj_ts, na.rm = T)
+post_ts_breaks = round(seq(post_ts_min, post_ts_max, length.out = 10),0)
+
+post_iron_min = min(plot_lm_table$post_iron, na.rm = T)
+post_iron_max = max(plot_lm_table$post_iron, na.rm = T)
+post_iron_breaks = round(seq(post_iron_min, post_iron_max, length.out = 10),0)
+
+post_crp_min = 0
+post_crp_max = 16
+post_crp_breaks = round(seq(0, post_crp_max, length.out = 10),1)
+
+plot_lm_table_axes = plot_lm_table %>%
+  mutate(adj_ts_scaled = (adj_ts - post_ts_min)/(post_ts_max - post_ts_min) * (lpa_pre_max - lpa_pre_min) + lpa_pre_min,
+         adj_iron_scaled = (adj_iron - post_iron_min)/(post_iron_max - post_iron_min) * (lpa_pre_max - lpa_pre_min) + lpa_pre_min,
+         adj_crp_scaled = (adj_crp - post_crp_min)/(post_crp_max - post_crp_min) * (lpa_pre_max - lpa_pre_min) + lpa_pre_min)
+
+(plot_end_ts_box = plot_lm_table %>%
+    ggplot(aes(x = pre_stratum, y = adj_ts, fill = pre_stratum, color = pre_stratum)) + 
+    geom_boxplot(alpha = 0.4, outlier.shape = NA, width = 0.5) +
+    geom_hline(yintercept = mean_ts, linetype = "dashed", color = "black", linewidth = 0.5) +
+    geom_jitter(width = 0.12, size = 1.8, alpha = 0.6) +
+    scale_y_continuous(breaks = post_ts_breaks) +
+    scale_fill_aaas() +
+    scale_color_aaas() +
+    labs(x = NULL, y = NULL) +
+    theme_classic(base_size = 12, base_family = "Times New Roman") +
+    theme(legend.position = "none", 
+          axis.title.y = element_blank(), 
+          axis.text.y = element_blank(),
+          axis.text.x = element_blank(),
+          axis.title.x = element_blank(),
+          plot.tag = element_blank(), 
+          element_text(color = "black")) +
+    annotate("text", x = 1.5, y = mean_ts, label = mean_ts, vjust = -0.5, size = 4, color = "black") +
+    annotate("text", x = 1.5, y = 80, label = label_post_ts_stratum, size = 4, color = "black"))
+
+
+(plot_end_ts_stratum = plot_lm_table_axes %>%
+    ggplot() +
+    geom_point(aes(x = 0, y = lpa_pre, color = pre_stratum), size = 2.5, alpha = 0.7, shape = 4) +
+    geom_point(aes(x = 1, y = adj_ts_scaled, color = pre_stratum), size = 2.5, alpha = 0.7) +
+    geom_segment(aes(x = 0, xend = 1, y = lpa_pre, yend = adj_ts_scaled, color = pre_stratum), alpha = 0.25, linewidth = 0.5) +
+    scale_x_continuous(breaks = c(0, 1), labels = c("Baseline Lp(a)", "Post-intervention indicator\n (baseline-adjusted)")) +
+    coord_cartesian(clip = "off") +
+    scale_y_continuous(name = "Pre Lp(a) (mg/dL)",
+                       limits = c(lpa_pre_min, lpa_pre_max),
+                       breaks = get_breaks(n = 10),
+                       sec.axis = sec_axis(trans = ~ (. - lpa_pre_min)/(lpa_pre_max - lpa_pre_min) * (post_ts_max - post_ts_min) + post_ts_min,
+                                           breaks = post_ts_breaks,
+                                           name = "Adj. transferrin saturation (%)")) +
+    scale_color_aaas() +
+    scale_fill_aaas() +
+    labs(x = NULL, color = NULL, tag = "A") +
+    theme_classic(base_size = 12,  base_family = "Times New Roman") +
+    theme(axis.title.y.left = element_text(color = "black", face = "bold"),
+          axis.text.y.left = element_text(color = "black"),
+          axis.title.y.right = element_text(color = "black", face = "bold"),
+          axis.text.y.right = element_text(color = "black"),
+          axis.text.x = element_blank(),
+          axis.title.x = element_blank(),
+          plot.tag = element_text(face = "bold", size = 12, family = "Times New Roman", color = "black"),
+          legend.position = "none"))
+ 
+(plot_ts_stratum = plot_end_ts_stratum + plot_end_ts_box)
+
+
+(plot_end_iron_box = plot_lm_table %>%
+    ggplot(aes(x = pre_stratum, y = adj_iron, fill = pre_stratum, color = pre_stratum)) + 
+    geom_boxplot(alpha = 0.4, outlier.shape = NA, width = 0.5) +
+    geom_hline(yintercept = mean_iron, linetype = "dashed", color = "black", linewidth = 0.5) +
+    geom_jitter(width = 0.12, size = 1.8, alpha = 0.6) +
+    scale_y_continuous(breaks = post_iron_breaks) +
+    scale_fill_aaas() +
+    scale_color_aaas() +
+    labs(x = NULL, y = NULL) +
+    theme_classic(base_size = 12, base_family = "Times New Roman") +
+    theme(legend.position = "none", 
+          axis.title.y = element_blank(), 
+          axis.text.y = element_blank(),
+          axis.text.x = element_blank(),
+          axis.title.x = element_blank(),
+          plot.tag = element_blank()) +
+    annotate("text", x = 1.5, y = mean_iron, label = mean_iron, vjust = -0.5, size = 4, color = "black") +
+    annotate("text", x = 1.5, y = 295, label = label_post_iron_stratum, size = 4, color = "black"))
+
+(plot_end_iron_stratum = plot_lm_table_axes %>%
+    ggplot() +
+    geom_point(aes(x = 0, y = lpa_pre, color = pre_stratum), size = 2.5, alpha = 0.7, shape = 4) +
+    geom_point(aes(x = 1, y = adj_iron_scaled, color = pre_stratum), size = 2.5, alpha = 0.7) +
+    geom_segment(aes(x = 0, xend = 1, y = lpa_pre, yend = adj_iron_scaled, color = pre_stratum), alpha = 0.25, linewidth = 0.5) +
+    scale_x_continuous(breaks = c(0, 1), labels = c("Baseline Lp(a)", "Post-intervention indicator\n (baseline-adjusted)")) +
+    coord_cartesian(clip = "off") +
+    scale_y_continuous(name = "Pre Lp(a) (mg/dL)",
+                       limits = c(lpa_pre_min, lpa_pre_max),
+                       breaks = get_breaks(n = 10),
+                       sec.axis = sec_axis(trans = ~ (. - lpa_pre_min)/(lpa_pre_max - lpa_pre_min) * (post_iron_max - post_iron_min) + post_iron_min,
+                                           breaks = post_iron_breaks,
+                                           name = "Adj. serum iron (µg/dL)")) +
+    scale_color_aaas() +
+    scale_fill_aaas() +
+    labs(x = NULL, color = NULL, tag = "B") +
+    theme_classic(base_size = 12,  base_family = "Times New Roman") +
+    theme(axis.title.y.left = element_text(color = "black", face = "bold"),
+          axis.text.y.left = element_text(color = "black"),
+          axis.title.y.right = element_text(color = "black", face = "bold"),
+          axis.text.y.right = element_text(color = "black"),
+          axis.text.x = element_blank(),
+          axis.title.x = element_blank(),
+          plot.tag = element_text(face = "bold", size = 12, family = "Times New Roman", color = "black"),
+          legend.position = "none"))
+ 
+(plot_iron_stratum = plot_end_iron_stratum + plot_end_iron_box)
+
+
+(plot_end_crp_box = plot_lm_table_axes %>%
+    #mutate(adj_crp = if_else(adj_crp<0, NA, adj_crp)) %>%
+    ggplot(aes(x = pre_stratum, y = adj_crp, fill = pre_stratum, color = pre_stratum)) + 
+    geom_boxplot(alpha = 0.4, outlier.shape = NA, width = 0.5) +
+    geom_hline(yintercept = mean_crp, linetype = "dashed", color = "black", linewidth = 0.5) +
+    geom_jitter(width = 0.12, size = 1.8, alpha = 0.6) +
+    scale_y_continuous(limits = c(post_crp_min, post_crp_max),
+                       breaks = post_crp_breaks) +
+    scale_fill_aaas() +
+    scale_color_aaas() +
+    labs(x = "Baseline Lp(a) concentration (mg/dL)", y = "Adj. hs-CRP (mg/L)" ) +
+    theme_classic(base_size = 12, base_family = "Times New Roman") + 
+    theme(legend.position = "none", 
+          axis.title.y = element_blank(), 
+          axis.text.y = element_blank(),
+          plot.tag = element_blank()) +
+    annotate("text", x = 1.5, y = mean_crp, label = mean_crp, vjust = -0.5, size = 4, color = "black") +
+    annotate("text", x = 1.5, y = 9, label = label_post_crp_stratum, size = 4, color = "black"))
+
+(plot_end_crp_stratum = plot_lm_table_axes %>%
+    ggplot() +
+    geom_point(aes(x = 0, y = lpa_pre, color = pre_stratum), size = 2.5, alpha = 0.7, shape = 4) +
+    geom_point(aes(x = 1, y = adj_crp_scaled, color = pre_stratum), size = 2.5, alpha = 0.7) +
+    geom_segment(aes(x = 0, xend = 1, y = lpa_pre, yend = adj_crp_scaled, color = pre_stratum), alpha = 0.25, linewidth = 0.5) +
+    scale_x_continuous(breaks = c(0, 1), labels = c("Baseline Lp(a)", "Post-intervention indicator\n (baseline-adjusted)")) +
+    coord_cartesian(clip = "off") +
+    scale_y_continuous(name = "Pre Lp(a) (mg/dL)",
+                       limits = c(lpa_pre_min, lpa_pre_max),
+                       breaks = get_breaks(n = 10),
+                       sec.axis = sec_axis(trans = ~ (. - lpa_pre_min)/(lpa_pre_max - lpa_pre_min) * (post_crp_max - post_crp_min) + post_crp_min,
+                                           breaks = post_crp_breaks,
+                                           name = "Adj. hs-CRP (mg/L)")) +
+    scale_color_aaas() +
+    scale_fill_aaas() +
+    labs(x = "8-Week iron supplementation", color = "Pre Lp(a) category", tag = "C") +
+    theme_classic(base_size = 12,  base_family = "Times New Roman") +
+    theme(axis.title.y.left = element_text(color = "black", face = "bold"),
+          axis.text.y.left = element_text(color = "black"),
+          axis.title.y.right = element_text(color = "black", face = "bold"),
+          axis.text.y.right = element_text(color = "black"),
+          plot.tag = element_text(face = "bold", size = 12, family = "Times New Roman", color = "black"),
+          legend.position = "none"))
+ 
+(plot_crp_stratum = plot_end_crp_stratum + plot_end_crp_box)
+
+
+(plot_post_combined_stratum = (plot_ts_stratum / plot_iron_stratum / plot_crp_stratum)) 
+
+ggsave("post_combined_stratum.pdf", plot = plot_post_combined_stratum, width = 7, height = 12, device = cairo_pdf)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
